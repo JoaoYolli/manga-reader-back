@@ -1,25 +1,21 @@
-const express = require("express");
-const bodyParser = require("body-parser");
+const express   = require("express");
+const bodyParser= require("body-parser");
 const jwt = require("jsonwebtoken");
-const fs = require("fs-extra");
-const path = require("path");
-const cors = require("cors");
-const axios = require('axios');
-
+const fs        = require("fs-extra");
+const path      = require("path");
+const cors      = require("cors");
+const axios     = require("axios");
 require("dotenv").config();
 
-const app = express();
-
-// Habilitar CORS para permitir solicitudes de cualquier origen
+const app       = express();
 app.use(cors());
 app.use(bodyParser.json());
 
-// Configuración
-const PORT = process.env.PORT || 3000;
+const PORT            = process.env.PORT || 3000;
 const SECRET_KEY = process.env.SECRET_KEY;
-const STORAGE_DIR = "./mangas";
+const STORAGE_DIR     = "./mangas";
 
-// Crear el directorio base si no existe
+// Asegurarnos del directorio base
 fs.ensureDirSync(STORAGE_DIR);
 
 // Middleware para validar el token
@@ -34,28 +30,23 @@ function authenticateToken(req, res, next) {
     });
 }
 
-// Endpoint para el proxy
-app.post('/proxy', authenticateToken, async (req, res) => {
-    const { token, url } = req.body;
-    // Validar la URL
-    if (!url || typeof url !== 'string') {
-        return res.status(400).json({ error: 'URL no válida' });
-    }
+// Helpers para manejar el fichero JSON de cada usuario
+async function readUserData(username) {
+  const file = path.join(STORAGE_DIR, `${username}.json`);
+  try {
+    const content = await fs.readFile(file, "utf8");
+    return JSON.parse(content);
+  } catch {
+    return { favorites: [], finished: {} };
+  }
+}
 
-    try {
-        // Hacer la solicitud a la URL proporcionada
-        const response = await axios.get(url, { responseType: 'arraybuffer' });
+async function writeUserData(username, data) {
+  const file = path.join(STORAGE_DIR, `${username}.json`);
+  await fs.writeFile(file, JSON.stringify(data, null, 2));
+}
 
-        // Retornar el contenido de la imagen con el tipo adecuado
-        res.set('Content-Type', response.headers['content-type']);
-        res.send(response.data);
-    } catch (error) {
-        console.error('Error al obtener la imagen:', error.message);
-        res.status(500).json({ error: 'No se pudo obtener la imagen' });
-    }
-});
-
-// Endpoint para obtener un token
+// Endpoint para obtener el token (se devuelve siempre el mismo)
 app.post("/get_token", (req, res) => {
     const { password } = req.body;
     if (password !== process.env.PASSWORD) {
@@ -66,107 +57,107 @@ app.post("/get_token", (req, res) => {
     res.json({ token });
 });
 
-// Endpoint para validar token
-app.post("/validate_token", authenticateToken, (req, res) => {
-    return res.status(200).json({ valid: "Token válido" });
+// Proxy de imágenes (sin cambios relevantes)
+app.post("/proxy", authenticateToken, async (req, res) => {
+  const { url } = req.body;
+  if (!url || typeof url !== "string") {
+    return res.status(400).json({ error: "URL no válida" });
+  }
+  try {
+    const response = await axios.get(url, { responseType: "arraybuffer" });
+    res.set("Content-Type", response.headers["content-type"]);
+    res.send(response.data);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "No se pudo obtener la imagen" });
+  }
 });
 
-// Endpoint para añadir un manga a favoritos
+app.post("/create_user", authenticateToken, async (req, res) => {
+    const { username } = req.body;
+    if (!username) return res.status(400).json({ error: "username requerido" });
+    const file = path.join(STORAGE_DIR, `${username}.json`);
+    if (await fs.pathExists(file)) {
+      return res.status(409).json({ error: "Usuario ya existe" });
+    }
+    await fs.writeFile(file, JSON.stringify({ favorites: [], finished: {} }, null, 2));
+    res.json({ success: true });
+  });
+  
+
+app.post("/list_users", authenticateToken, (req, res) => {
+    const files = fs.readdirSync(STORAGE_DIR);
+    // Filtrar solo .json y quitar extensión
+    const users = files
+      .filter(f => f.endsWith(".json"))
+      .map(f => path.basename(f, ".json"));
+    res.json({ users });
+  });
+  
+
+// Añadir manga a favoritos
 app.post("/add_fav", authenticateToken, async (req, res) => {
-    const { mangaName } = req.body;
-    if (!mangaName) {
-        return res.status(400).json({ error: "Nombre del manga es requerido" });
-    }
-
-    const favoritesFile = path.join(STORAGE_DIR, "favorites.txt");
-
-    try {
-        // Leer favoritos actuales
-        const favorites = (await fs.readFile(favoritesFile, "utf-8").catch(() => "")).split("\n").filter(Boolean);
-        if (!favorites.includes(mangaName)) {
-            favorites.push(mangaName);
-            await fs.writeFile(favoritesFile, favorites.join("\n"));
-        }
-        res.json({ success: true, message: `Manga "${mangaName}" añadido a favoritos.` });
-    } catch (err) {
-        res.status(500).json({ error: "Error al añadir el manga a favoritos" });
-    }
+  const { username, mangaName } = req.body;
+  if (!username || !mangaName) {
+    return res.status(400).json({ error: "username y mangaName son requeridos" });
+  }
+  const data = await readUserData(username);
+  if (!data.favorites.includes(mangaName)) {
+    data.favorites.push(mangaName);
+    await writeUserData(username, data);
+  }
+  res.json({ success: true, favorites: data.favorites });
 });
 
-// Endpoint para eliminar un manga de favoritos
+// Eliminar manga de favoritos
 app.post("/remove_fav", authenticateToken, async (req, res) => {
-    const { mangaName } = req.body;
-    if (!mangaName) {
-        return res.status(400).json({ error: "Nombre del manga es requerido" });
-    }
-
-    const favoritesFile = path.join(STORAGE_DIR, "favorites.txt");
-
-    try {
-        // Leer favoritos actuales
-        const favorites = (await fs.readFile(favoritesFile, "utf-8").catch(() => "")).split("\n").filter(Boolean);
-        const updatedFavorites = favorites.filter(name => name !== mangaName);
-
-        await fs.writeFile(favoritesFile, updatedFavorites.join("\n"));
-        res.json({ success: true, message: `Manga "${mangaName}" eliminado de favoritos.` });
-    } catch (err) {
-        res.status(500).json({ error: "Error al eliminar el manga de favoritos" });
-    }
+  const { username, mangaName } = req.body;
+  if (!username || !mangaName) {
+    return res.status(400).json({ error: "username y mangaName son requeridos" });
+  }
+  const data = await readUserData(username);
+  data.favorites = data.favorites.filter(m => m !== mangaName);
+  await writeUserData(username, data);
+  res.json({ success: true, favorites: data.favorites });
 });
 
-// Endpoint para obtener la lista de mangas favoritos
+// Obtener lista de favoritos
 app.post("/get_favorites", authenticateToken, async (req, res) => {
-    const favoritesFile = path.join(STORAGE_DIR, "favorites.txt");
-
-    try {
-        const favorites = (await fs.readFile(favoritesFile, "utf-8").catch(() => "")).split("\n").filter(Boolean);
-        res.json({ success: true, favorites });
-    } catch (err) {
-        res.status(500).json({ error: "Error al obtener los mangas favoritos" });
-    }
+  const { username } = req.body;
+  if (!username) {
+    return res.status(400).json({ error: "username es requerido" });
+  }
+  const data = await readUserData(username);
+  res.json({ success: true, favorites: data.favorites });
 });
 
-// Endpoint para añadir capítulos terminados
+// Añadir capítulo terminado
 app.post("/add_finished", authenticateToken, async (req, res) => {
-    const { mangaName, chapterNumber } = req.body;
-    if (!mangaName || !chapterNumber) {
-        return res.status(400).json({ error: "Manga y capítulo son requeridos" });
-    }
-
-    const mangaPath = path.join(STORAGE_DIR, mangaName);
-    const listFile = path.join(mangaPath, "list.txt");
-
-    try {
-        await fs.ensureDir(mangaPath);
-        const chapters = (await fs.readFile(listFile, "utf-8").catch(() => "")).split("\n").filter(Boolean);
-        if (!chapters.includes(chapterNumber.toString())) {
-            chapters.push(chapterNumber.toString());
-            await fs.writeFile(listFile, chapters.join("\n"));
-        }
-        res.json({ success: true, message: `Capítulo ${chapterNumber} añadido a ${mangaName}` });
-    } catch (err) {
-        res.status(500).json({ error: "Error al guardar el capítulo" });
-    }
+  const { username, mangaName, chapterNumber } = req.body;
+  if (!username || !mangaName || !chapterNumber) {
+    return res.status(400).json({ error: "username, mangaName y chapterNumber son requeridos" });
+  }
+  const data = await readUserData(username);
+  if (!data.finished[mangaName]) data.finished[mangaName] = [];
+  const chStr = chapterNumber.toString();
+  if (!data.finished[mangaName].includes(chStr)) {
+    data.finished[mangaName].push(chStr);
+    await writeUserData(username, data);
+  }
+  res.json({ success: true, finishedChapters: data.finished[mangaName] });
 });
 
-// Endpoint para obtener capítulos terminados
+// Obtener capítulos terminados de un manga
 app.post("/get_finished", authenticateToken, async (req, res) => {
-    const { mangaName } = req.body;
-    if (!mangaName) {
-        return res.status(400).json({ error: "Nombre del manga es requerido" });
-    }
-
-    const listFile = path.join(STORAGE_DIR, mangaName, "list.txt");
-
-    try {
-        const chapters = (await fs.readFile(listFile, "utf-8").catch(() => "")).split("\n").filter(Boolean);
-        res.json({ mangaName, finishedChapters: chapters });
-    } catch (err) {
-        res.status(500).json({ error: "Error al leer los capítulos terminados" });
-    }
+  const { username, mangaName } = req.body;
+  if (!username || !mangaName) {
+    return res.status(400).json({ error: "username y mangaName son requeridos" });
+  }
+  const data = await readUserData(username);
+  const chapters = data.finished[mangaName] || [];
+  res.json({ success: true, mangaName, finishedChapters: chapters });
 });
 
-// Iniciar el servidor
 app.listen(PORT, () => {
-    console.log(`Servidor ejecutándose en http://localhost:${PORT}`);
+  console.log(`Servidor ejecutándose en http://localhost:${PORT}`);
 });

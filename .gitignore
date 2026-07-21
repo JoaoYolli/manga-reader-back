@@ -1,3 +1,4 @@
 mangas/
 node_modules/
 notifications/
+.env

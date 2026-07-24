@@ -6,6 +6,8 @@ const path = require("path");
 const cors = require("cors");
 const axios = require("axios");
 const webPush = require('web-push');
+const bcrypt = require("bcryptjs");
+const crypto = require("crypto");
 require("dotenv").config();
 
 const app = express();
@@ -14,8 +16,25 @@ app.use(bodyParser.json());
 
 const PORT = process.env.PORT || 3000;
 const SECRET_KEY = process.env.SECRET_KEY;
-const STORAGE_DIR = "./mangas";
-const SUBS_FILE = path.join('./notifications/subscriptions.json');
+
+// Los directorios de datos viven fuera del repo de backend/ (hermanos de
+// backend/, frontend/, etc. en la carpeta wrapper), para que nunca queden
+// mezclados con el código y se pierdan/aparezcan como cambios al tocar
+// front o back. Por defecto se resuelven un nivel por encima de backend/
+// (uso local sin Docker); en Docker, docker-compose fija estas variables de
+// entorno para que apunten a los volúmenes montados en su lugar.
+const STORAGE_DIR = process.env.MANGAS_DIR || path.join(__dirname, "..", "mangas");
+const NOTIFICATIONS_DIR = process.env.NOTIFICATIONS_DIR || path.join(__dirname, "..", "notifications");
+const SUBS_FILE = path.join(NOTIFICATIONS_DIR, "subscriptions.json");
+const USERS_DIR = process.env.USERS_DIR || path.join(__dirname, "..", "users");
+const USERS_FILE = path.join(USERS_DIR, "users.json");
+const DEFAULT_PREFERENCES = { theme: "light", readingMode: "scroll" };
+
+// Administradores fijos por ahora (no hay gestión de roles todavía).
+const ADMIN_USERNAMES = new Set(["Joao"]);
+function isAdmin(username) {
+  return ADMIN_USERNAMES.has(username);
+}
 
 // Configura VAPID en tu backend (aunque aquí solo usamos la pública)
 const vapidPublicKey = process.env.PUBLIC_KEY;
@@ -29,7 +48,8 @@ webPush.setVapidDetails(
 
 // Asegurarnos del directorio base
 fs.ensureDirSync(STORAGE_DIR);
-fs.ensureDirSync('./notifications');
+fs.ensureDirSync(NOTIFICATIONS_DIR);
+fs.ensureDirSync(USERS_DIR);
 
 // Middleware para validar el token
 function authenticateToken(req, res, next) {
@@ -38,9 +58,66 @@ function authenticateToken(req, res, next) {
 
   jwt.verify(token, SECRET_KEY, (err, user) => {
     if (err) return res.status(403).json({ error: "Token caducado o incorrecto" });
+    if (!user || !user.username) return res.status(403).json({ error: "Token inválido" });
     req.user = user;
     next();
   });
+}
+
+// Middleware para restringir endpoints a administradores (requiere authenticateToken antes)
+function requireAdmin(req, res, next) {
+  if (!isAdmin(req.user.username)) {
+    return res.status(403).json({ error: "Requiere permisos de administrador" });
+  }
+  next();
+}
+
+// Helpers para el fichero users/users.json (cuentas: passwordHash + preferencias)
+async function readUsers() {
+  try {
+    const content = await fs.readFile(USERS_FILE, "utf8");
+    return JSON.parse(content);
+  } catch {
+    return {};
+  }
+}
+
+async function writeUsers(users) {
+  await fs.writeFile(USERS_FILE, JSON.stringify(users, null, 2));
+}
+
+// Migra automáticamente los perfiles que ya existían en mangas/*.json (creados
+// bajo el antiguo modelo de contraseña global compartida) a cuentas reales con
+// la contraseña global actual como contraseña por defecto. Idempotente: solo
+// rellena los que todavía no tengan cuenta en users.json.
+async function migrateLegacyProfiles() {
+  const users = await readUsers();
+  let files = [];
+  try {
+    files = await fs.readdir(STORAGE_DIR);
+  } catch {
+    return;
+  }
+
+  let changed = false;
+  const defaultPasswordHash = process.env.PASSWORD
+    ? await bcrypt.hash(process.env.PASSWORD, 10)
+    : null;
+
+  for (const file of files) {
+    if (!file.endsWith(".json")) continue;
+    const username = path.basename(file, ".json");
+    if (users[username] || !defaultPasswordHash) continue;
+    users[username] = {
+      passwordHash: defaultPasswordHash,
+      mustChangePassword: true,
+      preferences: { ...DEFAULT_PREFERENCES }
+    };
+    changed = true;
+    console.log(`🔐 Perfil heredado migrado a cuenta: ${username} (contraseña por defecto, debe cambiarla)`);
+  }
+
+  if (changed) await writeUsers(users);
 }
 
 // Helpers para manejar el fichero JSON de cada usuario
@@ -107,15 +184,171 @@ async function sendPushToAll(title, body) {
   return { success, failed };
 }
 
-// Endpoint para obtener el token (se devuelve siempre el mismo)
-app.post("/get_token", (req, res) => {
-  const { password } = req.body;
-  if (password !== process.env.PASSWORD) {
-    return res.status(403).json({ error: "Contraseña incorrecta" });
+// --- Códigos de invitación (solo un admin puede generarlos; de un solo uso y caducan) ---
+const INVITE_TTL_MS = 30 * 60 * 1000;
+let currentInvite = null; // { code, createdAt, used }
+
+function inviteIsValid(invite) {
+  return !!invite && !invite.used && Date.now() - invite.createdAt <= INVITE_TTL_MS;
+}
+
+app.post("/invite/current", authenticateToken, requireAdmin, (req, res) => {
+  if (!inviteIsValid(currentInvite)) return res.json({ code: null });
+  res.json({ code: currentInvite.code, expiresAt: currentInvite.createdAt + INVITE_TTL_MS });
+});
+
+app.post("/invite/generate", authenticateToken, requireAdmin, (req, res) => {
+  currentInvite = { code: crypto.randomBytes(4).toString("hex").toUpperCase(), createdAt: Date.now(), used: false };
+  res.json({ code: currentInvite.code, expiresAt: currentInvite.createdAt + INVITE_TTL_MS });
+});
+
+// --- Cuentas de usuario (usuario + contraseña propios) ---
+
+app.post("/register", async (req, res) => {
+  const { username, password, inviteCode } = req.body;
+  if (!username || !password) {
+    return res.status(400).json({ error: "username y password son requeridos" });
+  }
+  if (!inviteCode || !inviteIsValid(currentInvite) || inviteCode !== currentInvite.code) {
+    return res.status(403).json({ error: "Código de invitación inválido o caducado" });
   }
 
-  const token = jwt.sign({ user: "authorized" }, SECRET_KEY, { expiresIn: "24h" });
-  res.json({ token });
+  const users = await readUsers();
+  if (users[username]) {
+    return res.status(409).json({ error: "Usuario ya existe" });
+  }
+
+  const passwordHash = await bcrypt.hash(password, 10);
+  users[username] = {
+    passwordHash,
+    mustChangePassword: false,
+    preferences: { ...DEFAULT_PREFERENCES }
+  };
+  await writeUsers(users);
+  currentInvite.used = true;
+
+  const mangaFile = path.join(STORAGE_DIR, `${username}.json`);
+  if (!(await fs.pathExists(mangaFile))) {
+    await fs.writeFile(mangaFile, JSON.stringify({ favorites: [], finished: {} }, null, 2));
+  }
+
+  const token = jwt.sign({ username }, SECRET_KEY, { expiresIn: "24h" });
+  res.json({ token, username, mustChangePassword: false, isAdmin: isAdmin(username), preferences: users[username].preferences });
+});
+
+app.post("/login", async (req, res) => {
+  const { username, password } = req.body;
+  if (!username || !password) {
+    return res.status(400).json({ error: "username y password son requeridos" });
+  }
+
+  const users = await readUsers();
+  const account = users[username];
+  if (!account || !(await bcrypt.compare(password, account.passwordHash))) {
+    return res.status(403).json({ error: "Usuario o contraseña incorrectos" });
+  }
+
+  const token = jwt.sign({ username }, SECRET_KEY, { expiresIn: "24h" });
+  res.json({
+    token,
+    username,
+    mustChangePassword: !!account.mustChangePassword,
+    isAdmin: isAdmin(username),
+    preferences: account.preferences || DEFAULT_PREFERENCES
+  });
+});
+
+app.post("/change_password", authenticateToken, async (req, res) => {
+  const { newPassword } = req.body;
+  if (!newPassword) return res.status(400).json({ error: "newPassword es requerido" });
+
+  const users = await readUsers();
+  const account = users[req.user.username];
+  if (!account) return res.status(404).json({ error: "Usuario no encontrado" });
+
+  account.passwordHash = await bcrypt.hash(newPassword, 10);
+  account.mustChangePassword = false;
+  await writeUsers(users);
+  res.json({ success: true });
+});
+
+app.post("/validate_token", authenticateToken, (req, res) => {
+  res.json({ valid: true, username: req.user.username, isAdmin: isAdmin(req.user.username) });
+});
+
+app.post("/preferences", authenticateToken, async (req, res) => {
+  const { preferences } = req.body;
+  if (!preferences || typeof preferences !== "object") {
+    return res.status(400).json({ error: "preferences es requerido" });
+  }
+
+  const users = await readUsers();
+  const account = users[req.user.username];
+  if (!account) return res.status(404).json({ error: "Usuario no encontrado" });
+
+  account.preferences = { ...DEFAULT_PREFERENCES, ...account.preferences, ...preferences };
+  await writeUsers(users);
+  res.json({ success: true, preferences: account.preferences });
+});
+
+// --- Emparejamiento por QR (login en Smart TV sin escribir con el mando) ---
+// Estado en memoria, efímero (se pierde al reiniciar), igual que lastChapters
+// del job en background: no necesita persistir en disco.
+const PAIRING_TTL_MS = 5 * 60 * 1000;
+const pairings = new Map(); // pairingId -> { code, status, createdAt, username, token }
+
+function cleanupExpiredPairings() {
+  const now = Date.now();
+  for (const [id, p] of pairings) {
+    if (now - p.createdAt > PAIRING_TTL_MS) pairings.delete(id);
+  }
+}
+setInterval(cleanupExpiredPairings, 60 * 1000);
+
+app.post("/pair/create", (req, res) => {
+  cleanupExpiredPairings();
+  const pairingId = crypto.randomUUID();
+  const code = crypto.randomBytes(4).toString("hex").toUpperCase(); // p.ej. "A1B2C3D4"
+  pairings.set(pairingId, { code, status: "pending", createdAt: Date.now(), username: null, token: null });
+  res.json({ pairingId, code });
+});
+
+app.get("/pair/status/:pairingId", (req, res) => {
+  const pairing = pairings.get(req.params.pairingId);
+  if (!pairing || Date.now() - pairing.createdAt > PAIRING_TTL_MS) {
+    if (pairing) pairings.delete(req.params.pairingId);
+    return res.json({ status: "expired" });
+  }
+
+  if (pairing.status === "confirmed") {
+    const { token, username, mustChangePassword, isAdmin: admin, preferences } = pairing;
+    pairings.delete(req.params.pairingId); // de un solo uso
+    return res.json({ status: "confirmed", token, username, mustChangePassword, isAdmin: admin, preferences });
+  }
+
+  res.json({ status: "pending" });
+});
+
+app.post("/pair/confirm", authenticateToken, async (req, res) => {
+  cleanupExpiredPairings();
+  const { code } = req.body;
+  if (!code) return res.status(400).json({ error: "code es requerido" });
+
+  const entry = [...pairings.entries()].find(([, p]) => p.code === code && p.status === "pending");
+  if (!entry) return res.status(404).json({ error: "Código inválido o caducado" });
+
+  const users = await readUsers();
+  const account = users[req.user.username];
+  if (!account) return res.status(404).json({ error: "Usuario no encontrado" });
+
+  const [, pairing] = entry;
+  pairing.status = "confirmed";
+  pairing.username = req.user.username;
+  pairing.token = req.body.token;
+  pairing.mustChangePassword = !!account.mustChangePassword;
+  pairing.isAdmin = isAdmin(req.user.username);
+  pairing.preferences = account.preferences || DEFAULT_PREFERENCES;
+  res.json({ success: true });
 });
 
 // Proxy de imágenes (sin cambios relevantes)
@@ -171,33 +404,12 @@ app.post("/send_notif", async (req, res) => {
   res.json('Sended');
 });
 
-app.post("/create_user", authenticateToken, async (req, res) => {
-  const { username } = req.body;
-  if (!username) return res.status(400).json({ error: "username requerido" });
-  const file = path.join(STORAGE_DIR, `${username}.json`);
-  if (await fs.pathExists(file)) {
-    return res.status(409).json({ error: "Usuario ya existe" });
-  }
-  await fs.writeFile(file, JSON.stringify({ favorites: [], finished: {} }, null, 2));
-  res.json({ success: true });
-});
-
-
-app.post("/list_users", authenticateToken, (req, res) => {
-  const files = fs.readdirSync(STORAGE_DIR);
-  // Filtrar solo .json y quitar extensión
-  const users = files
-    .filter(f => f.endsWith(".json"))
-    .map(f => path.basename(f, ".json"));
-  res.json({ users });
-});
-
-
 // Añadir manga a favoritos
 app.post("/add_fav", authenticateToken, async (req, res) => {
-  const { username, mangaName } = req.body;
-  if (!username || !mangaName) {
-    return res.status(400).json({ error: "username y mangaName son requeridos" });
+  const { mangaName } = req.body;
+  const username = req.user.username;
+  if (!mangaName) {
+    return res.status(400).json({ error: "mangaName es requerido" });
   }
   const data = await readUserData(username);
   if (!data.favorites.includes(mangaName)) {
@@ -209,9 +421,10 @@ app.post("/add_fav", authenticateToken, async (req, res) => {
 
 // Eliminar manga de favoritos
 app.post("/remove_fav", authenticateToken, async (req, res) => {
-  const { username, mangaName } = req.body;
-  if (!username || !mangaName) {
-    return res.status(400).json({ error: "username y mangaName son requeridos" });
+  const { mangaName } = req.body;
+  const username = req.user.username;
+  if (!mangaName) {
+    return res.status(400).json({ error: "mangaName es requerido" });
   }
   const data = await readUserData(username);
   data.favorites = data.favorites.filter(m => m !== mangaName);
@@ -221,19 +434,16 @@ app.post("/remove_fav", authenticateToken, async (req, res) => {
 
 // Obtener lista de favoritos
 app.post("/get_favorites", authenticateToken, async (req, res) => {
-  const { username } = req.body;
-  if (!username) {
-    return res.status(400).json({ error: "username es requerido" });
-  }
-  const data = await readUserData(username);
+  const data = await readUserData(req.user.username);
   res.json({ success: true, favorites: data.favorites });
 });
 
 // Añadir capítulo terminado
 app.post("/add_finished", authenticateToken, async (req, res) => {
-  const { username, mangaName, chapterNumber } = req.body;
-  if (!username || !mangaName || !chapterNumber) {
-    return res.status(400).json({ error: "username, mangaName y chapterNumber son requeridos" });
+  const { mangaName, chapterNumber } = req.body;
+  const username = req.user.username;
+  if (!mangaName || !chapterNumber) {
+    return res.status(400).json({ error: "mangaName y chapterNumber son requeridos" });
   }
   const data = await readUserData(username);
   if (!data.finished[mangaName]) data.finished[mangaName] = [];
@@ -247,9 +457,10 @@ app.post("/add_finished", authenticateToken, async (req, res) => {
 
 // Obtener capítulos terminados de un manga
 app.post("/get_finished", authenticateToken, async (req, res) => {
-  const { username, mangaName } = req.body;
-  if (!username || !mangaName) {
-    return res.status(400).json({ error: "username y mangaName son requeridos" });
+  const { mangaName } = req.body;
+  const username = req.user.username;
+  if (!mangaName) {
+    return res.status(400).json({ error: "mangaName es requerido" });
   }
   const data = await readUserData(username);
   const chapters = data.finished[mangaName] || [];
@@ -284,7 +495,13 @@ async function startBackgroundTask() {
   setTimeout(job, INTERVAL);
 }
 
-startBackgroundTask();
+migrateLegacyProfiles()
+  .then(() => startBackgroundTask())
+  .catch(err => {
+    console.error('Error migrando perfiles heredados:', err);
+    startBackgroundTask();
+  });
+
 // Iniciar el servidor
 app.listen(PORT, () => {
   console.log(`Servidor ejecutándose en http://localhost:${PORT}`);

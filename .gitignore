@@ -1,4 +1,5 @@
 mangas/
 node_modules/
 notifications/
+users/
 .env

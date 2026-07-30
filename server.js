@@ -53,7 +53,7 @@ fs.ensureDirSync(USERS_DIR);
 
 // Middleware para validar el token
 function authenticateToken(req, res, next) {
-  const { token } = req.body;
+  const token = req.body.token || req.query.token;
   if (!token) return res.status(401).json({ error: "Token requerido" });
 
   jwt.verify(token, SECRET_KEY, (err, user) => {
@@ -352,15 +352,44 @@ app.post("/pair/confirm", authenticateToken, async (req, res) => {
 });
 
 // Proxy de imágenes (sin cambios relevantes)
+// Streaming en vez de bufferizar la imagen entera en memoria antes de
+// reenviarla: baja la latencia (el cliente empieza a recibir bytes antes)
+// y el costo de memoria por request, que ahora importa más porque las
+// descargas piden varias imágenes en paralelo (ver fetchImagesConcurrently
+// en sw.js) en vez de una por una.
+async function proxyImage(url, res) {
+  const response = await axios.get(url, { responseType: "stream" });
+  res.set("Content-Type", response.headers["content-type"]);
+  response.data.on("error", err => {
+    console.error("Error en el stream del proxy:", err);
+    res.end();
+  });
+  response.data.pipe(res);
+}
+
 app.post("/proxy", authenticateToken, async (req, res) => {
   const { url } = req.body;
   if (!url || typeof url !== "string") {
     return res.status(400).json({ error: "URL no válida" });
   }
   try {
-    const response = await axios.get(url, { responseType: "arraybuffer" });
-    res.set("Content-Type", response.headers["content-type"]);
-    res.send(response.data);
+    await proxyImage(url, res);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "No se pudo obtener la imagen" });
+  }
+});
+
+// Variante GET del proxy: la usa la descarga por Background Fetch, que no
+// admite requests con body ni con preflight CORS (solo GETs simples), así
+// que el token viaja como query param en vez de en el body.
+app.get("/proxy", authenticateToken, async (req, res) => {
+  const { url } = req.query;
+  if (!url || typeof url !== "string") {
+    return res.status(400).json({ error: "URL no válida" });
+  }
+  try {
+    await proxyImage(url, res);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "No se pudo obtener la imagen" });
@@ -369,6 +398,13 @@ app.post("/proxy", authenticateToken, async (req, res) => {
 
 app.get('/vapidPublicKey', (req, res) => {
   res.json({ vapidPublicKey });
+});
+
+// Estado de disponibilidad de InManga, mantenido por el chequeo dedicado de
+// abajo (cada 10 min) — solo lee el valor cacheado, no dispara una prueba
+// nueva contra la API externa en cada carga de página.
+app.get('/manga_source_status', (req, res) => {
+  res.json({ available: apiAvailability.available, lastCheckedAt: apiAvailability.lastCheckedAt });
 });
 
 app.post('/subscribe', async (req, res) => {
@@ -467,22 +503,64 @@ app.post("/get_finished", authenticateToken, async (req, res) => {
   res.json({ success: true, mangaName, finishedChapters: chapters });
 });
 
+// Estado de disponibilidad de InManga, mutado ÚNICAMENTE por
+// checkApiAvailability() (chequeo dedicado cada 10 min, más abajo). El resto
+// del código (job de favoritos, endpoint /manga_source_status) solo lo lee.
+let apiAvailability = { available: true, lastCheckedAt: 0 };
+
+async function checkApiAvailability() {
+  let isUp;
+  try {
+    const response = await axios.get(`https://jimov-api.vercel.app/manga/inmanga/filter?search=Dandadan&type=0`);
+    isUp = !!(response.data && response.data.results[0].title !== '');
+  } catch (err) {
+    isUp = false;
+  }
+
+  if (isUp && !apiAvailability.available) {
+    apiAvailability.available = true;
+    await sendPushToAll("InManga vuelve a estar disponible", "La página InManga está disponible. Ya puedes volver a leer mangas!! :)");
+  } else if (!isUp && apiAvailability.available) {
+    apiAvailability.available = false;
+    await sendPushToAll("InManga no disponible", "La página InManga no está disponible temporalmente. No se podrán obtener los capítulos de los mangas.");
+  }
+  apiAvailability.lastCheckedAt = Date.now();
+}
+
+function startApiAvailabilityChecker() {
+  const INTERVAL = 10 * 60 * 1000; // cada 10 minutos
+
+  async function tick() {
+    try {
+      await checkApiAvailability();
+    } catch (err) {
+      console.error('Error comprobando disponibilidad de InManga:', err);
+    } finally {
+      setTimeout(tick, INTERVAL);
+    }
+  }
+
+  // primera comprobación inmediata, para que /manga_source_status y el job
+  // de favoritos arranquen con un estado real desde el primer momento
+  tick();
+}
+
 async function startBackgroundTask() {
   const INTERVAL = 60 * 1000; // por ejemplo, cada 1 minuto
   let lastChapters = {
-    "mangas": {},
-    "inMangaWorks": true
+    "mangas": {}
   };
 
   async function job() {
     try {
       console.log('🕒 Tarea en background iniciada');
-      // Ejemplo: enviar un recordatorio o verificar algo
-      // console.log('Obteniendo mangas favoritos de todos los usuarios...');
-      const allFavorites = await getAllFavorites();
-      // console.log(allFavorites)
-      await getLatestChapters(allFavorites, lastChapters)
-      console.log(lastChapters);
+      if (apiAvailability.available) {
+        const allFavorites = await getAllFavorites();
+        await getLatestChapters(allFavorites, lastChapters)
+        console.log(lastChapters);
+      } else {
+        console.log('InManga no disponible, se omite la comprobación de nuevos capítulos');
+      }
     } catch (err) {
       console.error('Error en tarea en background:', err);
     } finally {
@@ -496,10 +574,14 @@ async function startBackgroundTask() {
 }
 
 migrateLegacyProfiles()
-  .then(() => startBackgroundTask())
+  .then(() => {
+    startBackgroundTask();
+    startApiAvailabilityChecker();
+  })
   .catch(err => {
     console.error('Error migrando perfiles heredados:', err);
     startBackgroundTask();
+    startApiAvailabilityChecker();
   });
 
 // Iniciar el servidor
@@ -523,52 +605,34 @@ async function getAllFavorites() {
 }
 
 //Aqui crea una funcion que recibiendo una lista de nombres de mangas, obtenga el ultimo capitulo publicado de cada uno
+// Nota: la detección de caída/recuperación de InManga vive por completo en
+// checkApiAvailability() (chequeo dedicado cada 10 min); esta función solo
+// se llama cuando apiAvailability.available === true (ver job() arriba), así
+// que no necesita volver a comprobar disponibilidad ni notificarla.
 async function getLatestChapters(mangaNames, lastChapters) {
-
-  if (lastChapters.inMangaWorks === false) {
-    const response = await axios.get(`https://jimov-api.vercel.app/manga/inmanga/filter?search=Dandadan&type=0`);
-    if (response.data && response.data.results[0].title !== '') {
-      lastChapters.inMangaWorks = true;
-      //notificar a todos los usuarios que InManga no esta disponible
-      await sendPushToAll("InManga vuelve a estar disponible", "La página InManga está disponible. Ya puedes volver a leer mangas!! :)");
-    }
-  } else {
-    //Haz una peticion a un api y si no devuelve nada la pagina esta caida(no hace falta comprobar lo que devuelve solo si devuelve algo)
-    for (const manga of mangaNames) {
-      try {
-        const response = await axios.get(`https://jimov-api.vercel.app/manga/inmanga/filter?search=${encodeURIComponent(manga)}&type=0`);
-        if (response.data && response.data.results[0].title !== '') {
-          //Quedarse con el resultado cuya propiedad title sea igual a manga
-          const foundManga = response.data.results.find(m => m.title === manga);
-          const mangaInfo = await axios.get(`https://jimov-api.vercel.app${foundManga.url}`);
-          //Obtener el capitulo mas reciente del manga en mangaInfo.data.chapters con la propiedad number mas alta
-          const latestChapter = mangaInfo.data.chapters.reduce((max, chapter) => {
-            return chapter.number > max.number ? chapter : max;
-          }, mangaInfo.data.chapters[0]);
-          // console.log(latestChapter)
-          //Si no existe el manga en la lista de clave valor lastChapters.mangas({}), lo añadimos
-          if (!lastChapters.mangas[manga]) {
-            lastChapters.mangas[manga] = [latestChapter.number];
-          } else {
-            if (lastChapters.mangas[manga] < latestChapter.number) {
-              // console.log('Si envia')
-              lastChapters.mangas[manga] = [latestChapter.number];
-              await sendPushToAll(`Nuevo Capitulo de ${manga}`, `Ya esta disponible el capítulo ${latestChapter.number} del manga ${manga}`);
-            }/*else{
-              console.log(lastChapters.mangas[manga][0])
-              console.log(`No hay nuevo capítulo de ${manga}, el último es ${latestChapter.number}`);
-            }*/
-          }
-          // console.log(lastChapters)
+  for (const manga of mangaNames) {
+    try {
+      const response = await axios.get(`https://jimov-api.vercel.app/manga/inmanga/filter?search=${encodeURIComponent(manga)}&type=0`);
+      if (response.data && response.data.results[0].title !== '') {
+        //Quedarse con el resultado cuya propiedad title sea igual a manga
+        const foundManga = response.data.results.find(m => m.title === manga);
+        const mangaInfo = await axios.get(`https://jimov-api.vercel.app${foundManga.url}`);
+        //Obtener el capitulo mas reciente del manga en mangaInfo.data.chapters con la propiedad number mas alta
+        const latestChapter = mangaInfo.data.chapters.reduce((max, chapter) => {
+          return chapter.number > max.number ? chapter : max;
+        }, mangaInfo.data.chapters[0]);
+        //Si no existe el manga en la lista de clave valor lastChapters.mangas({}), lo añadimos
+        if (!lastChapters.mangas[manga]) {
+          lastChapters.mangas[manga] = [latestChapter.number];
         } else {
-          lastChapters.inMangaWorks = false;
-          //notificar a todos los usuarios que InManga no esta disponible
-          await sendPushToAll("InManga no disponible", "La página InManga no está disponible temporalmente. No se podrán obtener los capítulos de los mangas.");
+          if (lastChapters.mangas[manga] < latestChapter.number) {
+            lastChapters.mangas[manga] = [latestChapter.number];
+            await sendPushToAll(`Nuevo Capitulo de ${manga}`, `Ya esta disponible el capítulo ${latestChapter.number} del manga ${manga}`);
+          }
         }
-      } catch (err) {
       }
+    } catch (err) {
     }
   }
   return lastChapters;
-
 }

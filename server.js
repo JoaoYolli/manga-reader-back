@@ -8,14 +8,55 @@ const axios = require("axios");
 const webPush = require('web-push');
 const bcrypt = require("bcryptjs");
 const crypto = require("crypto");
+const rateLimit = require("express-rate-limit");
 require("dotenv").config();
 
+// Una promesa rechazada sin capturar dentro de un handler async de Express 4
+// (que no las atrapa solo) tumba el proceso entero en Node 15+ (comportamiento
+// por defecto: terminar). Cualquier usuario autenticado podía tirar el
+// servicio para todos con una sola petición (ver /add_finished y el guard de
+// "__proto__" más abajo) — esto es la red de seguridad general para que un
+// bug de ese tipo quede solo en el log, no tumbe el backend entero.
+process.on("unhandledRejection", (reason) => {
+  console.error("⚠️ Promesa rechazada sin capturar:", reason);
+});
+
 const app = express();
-app.use(cors());
+
+// CORS restringido a los orígenes reales de la app (antes abierto a
+// cualquier origen). El desktop (Electron) y el móvil/TV (Capacitor) cargan
+// directamente la URL real de producción — no un esquema tipo capacitor://—
+// así que su Origin es el mismo que el de un navegador normal en el sitio.
+// Se permite también localhost/127.0.0.1 en cualquier puerto para
+// desarrollo/pruebas locales. Peticiones sin cabecera Origin (curl,
+// buenos_dias.sh, apps nativas que no la mandan) no se bloquean: CORS es una
+// restricción del navegador, no protege nada frente a esos clientes.
+const ALLOWED_ORIGINS = ["https://manga.yolli.xyz"];
+const LOCAL_ORIGIN_RE = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/;
+
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin || ALLOWED_ORIGINS.includes(origin) || LOCAL_ORIGIN_RE.test(origin)) {
+      return callback(null, true);
+    }
+    callback(new Error("Origen no permitido por CORS"));
+  }
+}));
 app.use(bodyParser.json());
 
 const PORT = process.env.PORT || 3000;
 const SECRET_KEY = process.env.SECRET_KEY;
+
+// Limita intentos de fuerza bruta contra login/registro/notificaciones/admin
+// desde fuera de la red local — la API es alcanzable desde internet, no solo
+// desde la LAN, así que no hay ninguna otra capa que frene esto.
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Demasiados intentos. Inténtalo de nuevo en unos minutos." }
+});
 
 // Los directorios de datos viven fuera del repo de backend/ (hermanos de
 // backend/, frontend/, etc. en la carpeta wrapper), para que nunca queden
@@ -29,6 +70,21 @@ const SUBS_FILE = path.join(NOTIFICATIONS_DIR, "subscriptions.json");
 const USERS_DIR = process.env.USERS_DIR || path.join(__dirname, "..", "users");
 const USERS_FILE = path.join(USERS_DIR, "users.json");
 const DEFAULT_PREFERENCES = { theme: "light", readingMode: "scroll" };
+
+// username termina siendo parte de un nombre de fichero (ver /register y
+// readUserData/writeUserData) — solo caracteres seguros para una ruta.
+const USERNAME_RE = /^[A-Za-z0-9_-]{3,32}$/;
+
+// mangaName se usa como clave de objeto (data.finished[mangaName]) — con
+// "__proto__" como valor, ese acceso devuelve Object.prototype en vez de
+// undefined, y llamar a .includes()/.push() sobre eso lanza una excepción
+// sin capturar dentro de un handler async, lo que tumba el proceso entero
+// (ver el process.on('unhandledRejection') de arriba). Cualquier usuario
+// autenticado podía tirar el backend con una sola petición a /add_finished.
+const DANGEROUS_OBJECT_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+function isDangerousKey(key) {
+  return DANGEROUS_OBJECT_KEYS.has(key);
+}
 
 // Administradores fijos por ahora (no hay gestión de roles todavía).
 const ADMIN_USERNAMES = new Set(["Joao"]);
@@ -56,7 +112,10 @@ function authenticateToken(req, res, next) {
   const token = req.body.token || req.query.token;
   if (!token) return res.status(401).json({ error: "Token requerido" });
 
-  jwt.verify(token, SECRET_KEY, (err, user) => {
+  // algorithms fijo explícitamente: recomendación de la propia librería
+  // jsonwebtoken, para no depender solo de su inferencia automática por tipo
+  // de secreto a la hora de descartar algoritmos no-HMAC.
+  jwt.verify(token, SECRET_KEY, { algorithms: ["HS256"] }, (err, user) => {
     if (err) return res.status(403).json({ error: "Token caducado o incorrecto" });
     if (!user || !user.username) return res.status(403).json({ error: "Token inválido" });
     req.user = user;
@@ -204,10 +263,21 @@ app.post("/invite/generate", authenticateToken, requireAdmin, (req, res) => {
 
 // --- Cuentas de usuario (usuario + contraseña propios) ---
 
-app.post("/register", async (req, res) => {
+app.post("/register", authLimiter, async (req, res) => {
   const { username, password, inviteCode } = req.body;
   if (!username || !password) {
     return res.status(400).json({ error: "username y password son requeridos" });
+  }
+  // username acaba formando parte de una ruta de fichero (mangas/{username}.json,
+  // ver readUserData/writeUserData) — sin este filtro, un username como
+  // "../users/users" resuelve fuera de mangas/ y puede llegar a sobrescribir
+  // users/users.json (carpeta hermana) con el JSON de favoritos/leídos,
+  // destruyendo los hashes de contraseña de todas las cuentas.
+  if (!USERNAME_RE.test(username)) {
+    return res.status(400).json({ error: "El usuario debe tener entre 3 y 32 caracteres: letras, números, guiones o guiones bajos." });
+  }
+  if (password.length < 8) {
+    return res.status(400).json({ error: "La contraseña debe tener al menos 8 caracteres." });
   }
   if (!inviteCode || !inviteIsValid(currentInvite) || inviteCode !== currentInvite.code) {
     return res.status(403).json({ error: "Código de invitación inválido o caducado" });
@@ -236,7 +306,7 @@ app.post("/register", async (req, res) => {
   res.json({ token, username, mustChangePassword: false, isAdmin: isAdmin(username), preferences: users[username].preferences });
 });
 
-app.post("/login", async (req, res) => {
+app.post("/login", authLimiter, async (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) {
     return res.status(400).json({ error: "username y password son requeridos" });
@@ -261,6 +331,7 @@ app.post("/login", async (req, res) => {
 app.post("/change_password", authenticateToken, async (req, res) => {
   const { newPassword } = req.body;
   if (!newPassword) return res.status(400).json({ error: "newPassword es requerido" });
+  if (newPassword.length < 8) return res.status(400).json({ error: "La contraseña debe tener al menos 8 caracteres." });
 
   const users = await readUsers();
   const account = users[req.user.username];
@@ -270,6 +341,39 @@ app.post("/change_password", authenticateToken, async (req, res) => {
   account.mustChangePassword = false;
   await writeUsers(users);
   res.json({ success: true });
+});
+
+// Genera una contraseña temporal legible (sin 0/O/1/l/I, que se confunden al
+// leerla o copiarla a mano) para que un admin se la pueda pasar al usuario.
+function generateRandomPassword(length = 12) {
+  const charset = "ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789";
+  let password = "";
+  for (let i = 0; i < length; i++) {
+    password += charset[crypto.randomInt(charset.length)];
+  }
+  return password;
+}
+
+// Solo un admin puede reiniciar la contraseña de otra cuenta. La nueva
+// contraseña aleatoria se devuelve UNA vez en esta respuesta (no se guarda en
+// claro en ningún sitio, solo su hash) para que el admin se la pase al
+// usuario; mustChangePassword:true reutiliza el mismo modal de "cambia tu
+// contraseña" que ya se muestra a los perfiles heredados en su primer login,
+// así que el usuario la cambia por una suya en cuanto entre.
+app.post("/admin/reset_password", authenticateToken, requireAdmin, async (req, res) => {
+  const { username } = req.body;
+  if (!username) return res.status(400).json({ error: "username es requerido" });
+
+  const users = await readUsers();
+  const account = users[username];
+  if (!account) return res.status(404).json({ error: "Usuario no encontrado" });
+
+  const newPassword = generateRandomPassword();
+  account.passwordHash = await bcrypt.hash(newPassword, 10);
+  account.mustChangePassword = true;
+  await writeUsers(users);
+
+  res.json({ success: true, username, newPassword });
 });
 
 app.post("/validate_token", authenticateToken, (req, res) => {
@@ -351,7 +455,29 @@ app.post("/pair/confirm", authenticateToken, async (req, res) => {
   res.json({ success: true });
 });
 
-// Proxy de imágenes (sin cambios relevantes)
+// Proxy de imágenes
+// Dominios reales desde los que jimov-api sirve imágenes de InManga
+// (comprobado contra la API real, agosto 2026): miniaturas en inmanga.com,
+// páginas de capítulo en intomanga.com (subdominios pack-*). Sin esta
+// lista, /proxy era un proxy abierto — aceptaba cualquier URL con solo
+// comprobar que era un string — así que cualquier usuario autenticado podía
+// hacer que el servidor hiciera peticiones a cualquier destino (SSRF),
+// incluida la propia red local donde vive este backend, y leer la
+// respuesta a través del stream. Solo se permite https:// a estos dominios
+// o subdominios suyos.
+const ALLOWED_PROXY_HOSTS = ["inmanga.com", "intomanga.com"];
+
+function isAllowedProxyUrl(urlString) {
+  let parsed;
+  try {
+    parsed = new URL(urlString);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== "https:") return false;
+  return ALLOWED_PROXY_HOSTS.some(host => parsed.hostname === host || parsed.hostname.endsWith(`.${host}`));
+}
+
 // Streaming en vez de bufferizar la imagen entera en memoria antes de
 // reenviarla: baja la latencia (el cliente empieza a recibir bytes antes)
 // y el costo de memoria por request, que ahora importa más porque las
@@ -369,7 +495,7 @@ async function proxyImage(url, res) {
 
 app.post("/proxy", authenticateToken, async (req, res) => {
   const { url } = req.body;
-  if (!url || typeof url !== "string") {
+  if (!url || typeof url !== "string" || !isAllowedProxyUrl(url)) {
     return res.status(400).json({ error: "URL no válida" });
   }
   try {
@@ -385,7 +511,7 @@ app.post("/proxy", authenticateToken, async (req, res) => {
 // que el token viaja como query param en vez de en el body.
 app.get("/proxy", authenticateToken, async (req, res) => {
   const { url } = req.query;
-  if (!url || typeof url !== "string") {
+  if (!url || typeof url !== "string" || !isAllowedProxyUrl(url)) {
     return res.status(400).json({ error: "URL no válida" });
   }
   try {
@@ -430,13 +556,22 @@ app.post('/subscribe', async (req, res) => {
   return res.status(201).json({ success: true });
 });
 
-app.post("/send_notif", async (req, res) => {
+// Compara en tiempo constante para no filtrar la contraseña carácter a
+// carácter vía diferencias de tiempo de respuesta (crypto.timingSafeEqual
+// exige buffers del mismo tamaño, así que primero se igualan longitudes).
+function safeCompare(a, b) {
+  const bufA = Buffer.from(String(a ?? ""));
+  const bufB = Buffer.from(String(b ?? ""));
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
+app.post("/send_notif", authLimiter, async (req, res) => {
   const { password, title, body } = req.body;
-  if (password !== process.env.PASSWORD) {
+  if (!process.env.PASSWORD || !safeCompare(password, process.env.PASSWORD)) {
     return res.status(403).json({ error: "Contraseña incorrecta" });
   }
   await sendPushToAll(title, body);
-  const token = jwt.sign({ user: "authorized" }, SECRET_KEY, { expiresIn: "24h" });
   res.json('Sended');
 });
 
@@ -481,6 +616,9 @@ app.post("/add_finished", authenticateToken, async (req, res) => {
   if (!mangaName || !chapterNumber) {
     return res.status(400).json({ error: "mangaName y chapterNumber son requeridos" });
   }
+  if (isDangerousKey(mangaName)) {
+    return res.status(400).json({ error: "mangaName no válido" });
+  }
   const data = await readUserData(username);
   if (!data.finished[mangaName]) data.finished[mangaName] = [];
   const chStr = chapterNumber.toString();
@@ -497,6 +635,9 @@ app.post("/get_finished", authenticateToken, async (req, res) => {
   const username = req.user.username;
   if (!mangaName) {
     return res.status(400).json({ error: "mangaName es requerido" });
+  }
+  if (isDangerousKey(mangaName)) {
+    return res.status(400).json({ error: "mangaName no válido" });
   }
   const data = await readUserData(username);
   const chapters = data.finished[mangaName] || [];
@@ -583,6 +724,19 @@ migrateLegacyProfiles()
     startBackgroundTask();
     startApiAvailabilityChecker();
   });
+
+// Manejador de errores genérico — tiene que ir después de todas las rutas.
+// Sin esto, Express usa su manejador por defecto, que devuelve una traza de
+// pila completa (rutas absolutas del servidor incluidas, ver el rechazo de
+// CORS de arriba) a cualquiera que la dispare, sin importar si es un fallo
+// de CORS, un JSON mal formado en el body, o cualquier otro error.
+app.use((err, req, res, next) => {
+  if (err && err.message === "Origen no permitido por CORS") {
+    return res.status(403).json({ error: "Origen no permitido" });
+  }
+  console.error("Error no controlado:", err);
+  res.status(500).json({ error: "Error interno del servidor" });
+});
 
 // Iniciar el servidor
 app.listen(PORT, () => {

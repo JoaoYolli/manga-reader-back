@@ -23,6 +23,17 @@ process.on("unhandledRejection", (reason) => {
 
 const app = express();
 
+// En producción hay un Apache2 delante haciendo de proxy inverso por
+// subdominio hacia este contenedor (ver CLAUDE.md) — Express no lo sabe por
+// defecto, así que ve la conexión TCP del propio Apache para TODAS las
+// peticiones en vez de la IP real de cada usuario. Sin esto, el rate
+// limiting de más abajo trataría a todo el mundo como una sola IP
+// compartiendo el mismo límite. "1" = confiar exactamente en ese salto
+// inmediato (Apache añade X-Forwarded-For por defecto al hacer de proxy) —
+// no más allá, para que nadie pueda falsificar esa cabecera y saltarse el
+// límite fingiendo una IP distinta en cada petición.
+app.set("trust proxy", 1);
+
 // CORS restringido a los orígenes reales de la app (antes abierto a
 // cualquier origen). El desktop (Electron) y el móvil/TV (Capacitor) cargan
 // directamente la URL real de producción — no un esquema tipo capacitor://—

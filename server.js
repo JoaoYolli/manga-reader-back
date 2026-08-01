@@ -97,6 +97,15 @@ function isDangerousKey(key) {
   return DANGEROUS_OBJECT_KEYS.has(key);
 }
 
+// Límites generosos (muy por encima de cualquier uso real: el manhwa más
+// largo del catálogo no llega a 5000 capítulos) para que una cuenta
+// autenticada — aunque solo sea una invitada de baja confianza — no pueda
+// hinchar sin límite su propio mangas/{username}.json.
+const MAX_MANGA_NAME_LENGTH = 200;
+const MAX_FAVORITES = 500;
+const MAX_FINISHED_MANGAS = 500;
+const MAX_CHAPTERS_PER_MANGA = 5000;
+
 // Administradores fijos por ahora (no hay gestión de roles todavía).
 const ADMIN_USERNAMES = new Set(["Joao"]);
 function isAdmin(username) {
@@ -126,10 +135,32 @@ function authenticateToken(req, res, next) {
   // algorithms fijo explícitamente: recomendación de la propia librería
   // jsonwebtoken, para no depender solo de su inferencia automática por tipo
   // de secreto a la hora de descartar algoritmos no-HMAC.
-  jwt.verify(token, SECRET_KEY, { algorithms: ["HS256"] }, (err, user) => {
+  jwt.verify(token, SECRET_KEY, { algorithms: ["HS256"] }, async (err, payload) => {
     if (err) return res.status(403).json({ error: "Token caducado o incorrecto" });
-    if (!user || !user.username) return res.status(403).json({ error: "Token inválido" });
-    req.user = user;
+    if (!payload || !payload.username) return res.status(403).json({ error: "Token inválido" });
+
+    // tokenVersion permite invalidar tokens ya emitidos sin esperar a que
+    // caduquen solos (hasta 24h) — se sube en /change_password y
+    // /admin/reset_password, así que un token robado deja de servir en
+    // cuanto la cuenta cambia de contraseña, no 24h después. Los tokens
+    // firmados antes de que existiera este campo no lo llevan en el payload
+    // (se tratan como versión 0), igual que las cuentas sin el campo
+    // todavía en users.json — así desplegar esto no invalida de golpe
+    // ninguna sesión ya activa.
+    let users;
+    try {
+      users = await readUsers();
+    } catch (readErr) {
+      console.error("Error leyendo users.json en authenticateToken:", readErr);
+      return res.status(500).json({ error: "Error interno del servidor" });
+    }
+    const account = users[payload.username];
+    if (!account) return res.status(403).json({ error: "Token inválido" });
+    if ((payload.tokenVersion || 0) !== (account.tokenVersion || 0)) {
+      return res.status(403).json({ error: "Sesión invalidada, vuelve a iniciar sesión" });
+    }
+
+    req.user = payload;
     next();
   });
 }
@@ -169,9 +200,21 @@ async function migrateLegacyProfiles() {
     return;
   }
 
+  // LEGACY_MIGRATION_PASSWORD es un secreto propio, separado de PASSWORD
+  // (que sigue siendo solo la clave de /send_notif, sin tocar buenos_dias.sh).
+  // Antes ambos usos compartían la misma variable — si PASSWORD se filtraba
+  // o se adivinaba por cualquiera de los dos motivos, cualquier cuenta
+  // heredada que aún no se hubiera logueado (y por tanto seguía con esta
+  // contraseña por defecto) quedaba accesible. Cae de vuelta a PASSWORD si
+  // la nueva variable no está puesta, para no romper un despliegue existente
+  // en silencio, pero avisando de que conviene fijarla aparte.
+  const legacyPassword = process.env.LEGACY_MIGRATION_PASSWORD || process.env.PASSWORD;
+  if (!process.env.LEGACY_MIGRATION_PASSWORD && process.env.PASSWORD) {
+    console.warn("⚠️ LEGACY_MIGRATION_PASSWORD no está definida — usando PASSWORD como respaldo. Defínela por separado para no compartir el mismo secreto con /send_notif.");
+  }
   let changed = false;
-  const defaultPasswordHash = process.env.PASSWORD
-    ? await bcrypt.hash(process.env.PASSWORD, 10)
+  const defaultPasswordHash = legacyPassword
+    ? await bcrypt.hash(legacyPassword, 10)
     : null;
 
   for (const file of files) {
@@ -303,6 +346,7 @@ app.post("/register", authLimiter, async (req, res) => {
   users[username] = {
     passwordHash,
     mustChangePassword: false,
+    tokenVersion: 0,
     preferences: { ...DEFAULT_PREFERENCES }
   };
   await writeUsers(users);
@@ -313,7 +357,7 @@ app.post("/register", authLimiter, async (req, res) => {
     await fs.writeFile(mangaFile, JSON.stringify({ favorites: [], finished: {} }, null, 2));
   }
 
-  const token = jwt.sign({ username }, SECRET_KEY, { expiresIn: "24h" });
+  const token = jwt.sign({ username, tokenVersion: 0 }, SECRET_KEY, { expiresIn: "24h" });
   res.json({ token, username, mustChangePassword: false, isAdmin: isAdmin(username), preferences: users[username].preferences });
 });
 
@@ -329,7 +373,7 @@ app.post("/login", authLimiter, async (req, res) => {
     return res.status(403).json({ error: "Usuario o contraseña incorrectos" });
   }
 
-  const token = jwt.sign({ username }, SECRET_KEY, { expiresIn: "24h" });
+  const token = jwt.sign({ username, tokenVersion: account.tokenVersion || 0 }, SECRET_KEY, { expiresIn: "24h" });
   res.json({
     token,
     username,
@@ -350,6 +394,10 @@ app.post("/change_password", authenticateToken, async (req, res) => {
 
   account.passwordHash = await bcrypt.hash(newPassword, 10);
   account.mustChangePassword = false;
+  // Invalida cualquier token ya emitido para esta cuenta (ver
+  // authenticateToken) — si alguien tenía un token robado, deja de servirle
+  // en cuanto la contraseña cambia, no hasta que caduque solo.
+  account.tokenVersion = (account.tokenVersion || 0) + 1;
   await writeUsers(users);
   res.json({ success: true });
 });
@@ -382,6 +430,7 @@ app.post("/admin/reset_password", authenticateToken, requireAdmin, async (req, r
   const newPassword = generateRandomPassword();
   account.passwordHash = await bcrypt.hash(newPassword, 10);
   account.mustChangePassword = true;
+  account.tokenVersion = (account.tokenVersion || 0) + 1; // ver /change_password
   await writeUsers(users);
 
   res.json({ success: true, username, newPassword });
@@ -476,7 +525,15 @@ app.post("/pair/confirm", authenticateToken, async (req, res) => {
 // incluida la propia red local donde vive este backend, y leer la
 // respuesta a través del stream. Solo se permite https:// a estos dominios
 // o subdominios suyos.
-const ALLOWED_PROXY_HOSTS = ["inmanga.com", "intomanga.com"];
+// Restringido también por prefijo de ruta, no solo por dominio: sin esto,
+// una cuenta autenticada podía usar /proxy para pedir cualquier ruta de
+// inmanga.com/intomanga.com, no solo imágenes — bajo impacto (son dominios
+// de contenido legítimo) pero innecesario. /thumbnails/ e /images/ son los
+// prefijos reales observados (miniaturas y páginas de capítulo respectivamente).
+const ALLOWED_PROXY_RULES = [
+  { host: "inmanga.com", pathPrefix: "/thumbnails/" },
+  { host: "intomanga.com", pathPrefix: "/images/" }
+];
 
 function isAllowedProxyUrl(urlString) {
   let parsed;
@@ -486,7 +543,10 @@ function isAllowedProxyUrl(urlString) {
     return false;
   }
   if (parsed.protocol !== "https:") return false;
-  return ALLOWED_PROXY_HOSTS.some(host => parsed.hostname === host || parsed.hostname.endsWith(`.${host}`));
+  return ALLOWED_PROXY_RULES.some(({ host, pathPrefix }) =>
+    (parsed.hostname === host || parsed.hostname.endsWith(`.${host}`)) &&
+    parsed.pathname.startsWith(pathPrefix)
+  );
 }
 
 // Streaming en vez de bufferizar la imagen entera en memoria antes de
@@ -544,12 +604,26 @@ app.get('/manga_source_status', (req, res) => {
   res.json({ available: apiAvailability.available, lastCheckedAt: apiAvailability.lastCheckedAt });
 });
 
-app.post('/subscribe', async (req, res) => {
-  const subscription = req.body;
+// Requiere sesión: antes cualquiera en internet podía mandar un endpoint
+// inventado sin límite, inflando notifications/subscriptions.json y
+// disparando un push real de "Nueva suscripción" a todos los usuarios reales
+// cada vez, gratis y sin ninguna cuenta. La suscripción en sí sigue sin
+// atarse a un usuario concreto (los pushes siguen siendo para todos, mismo
+// diseño de siempre) — el token solo demuestra que quien llama tiene una
+// cuenta válida, no identifica de quién es la suscripción.
+app.post('/subscribe', authenticateToken, async (req, res) => {
+  const { subscription } = req.body;
 
-  // Validación básica
-  if (!subscription || !subscription.endpoint) {
-    return res.status(400).json({ error: 'Subscripción inválida: falta endpoint' });
+  // Validación de forma, no solo de que exista `endpoint`: una suscripción
+  // Web Push real siempre trae también las claves de cifrado.
+  if (
+    !subscription ||
+    typeof subscription.endpoint !== "string" ||
+    !subscription.keys ||
+    typeof subscription.keys.p256dh !== "string" ||
+    typeof subscription.keys.auth !== "string"
+  ) {
+    return res.status(400).json({ error: 'Suscripción inválida' });
   }
 
   let subscriptions = loadSubscriptions();
@@ -590,11 +664,17 @@ app.post("/send_notif", authLimiter, async (req, res) => {
 app.post("/add_fav", authenticateToken, async (req, res) => {
   const { mangaName } = req.body;
   const username = req.user.username;
-  if (!mangaName) {
+  if (!mangaName || typeof mangaName !== "string") {
     return res.status(400).json({ error: "mangaName es requerido" });
+  }
+  if (mangaName.length > MAX_MANGA_NAME_LENGTH) {
+    return res.status(400).json({ error: "mangaName demasiado largo" });
   }
   const data = await readUserData(username);
   if (!data.favorites.includes(mangaName)) {
+    if (data.favorites.length >= MAX_FAVORITES) {
+      return res.status(400).json({ error: `Límite de ${MAX_FAVORITES} favoritos alcanzado` });
+    }
     data.favorites.push(mangaName);
     await writeUserData(username, data);
   }
@@ -630,10 +710,21 @@ app.post("/add_finished", authenticateToken, async (req, res) => {
   if (isDangerousKey(mangaName)) {
     return res.status(400).json({ error: "mangaName no válido" });
   }
+  if (typeof mangaName !== "string" || mangaName.length > MAX_MANGA_NAME_LENGTH) {
+    return res.status(400).json({ error: "mangaName no válido" });
+  }
   const data = await readUserData(username);
-  if (!data.finished[mangaName]) data.finished[mangaName] = [];
+  if (!data.finished[mangaName]) {
+    if (Object.keys(data.finished).length >= MAX_FINISHED_MANGAS) {
+      return res.status(400).json({ error: `Límite de ${MAX_FINISHED_MANGAS} mangas con progreso alcanzado` });
+    }
+    data.finished[mangaName] = [];
+  }
   const chStr = chapterNumber.toString();
   if (!data.finished[mangaName].includes(chStr)) {
+    if (data.finished[mangaName].length >= MAX_CHAPTERS_PER_MANGA) {
+      return res.status(400).json({ error: `Límite de ${MAX_CHAPTERS_PER_MANGA} capítulos alcanzado` });
+    }
     data.finished[mangaName].push(chStr);
     await writeUserData(username, data);
   }

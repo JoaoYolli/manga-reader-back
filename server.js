@@ -80,7 +80,19 @@ const NOTIFICATIONS_DIR = process.env.NOTIFICATIONS_DIR || path.join(__dirname, 
 const SUBS_FILE = path.join(NOTIFICATIONS_DIR, "subscriptions.json");
 const USERS_DIR = process.env.USERS_DIR || path.join(__dirname, "..", "users");
 const USERS_FILE = path.join(USERS_DIR, "users.json");
-const DEFAULT_PREFERENCES = { theme: "light", readingMode: "scroll" };
+// books/ contiene los .epub/.pdf reales, copiados a mano por el owner
+// (nunca subidos desde la web) — compartidos entre todos los usuarios, igual
+// que el manga no tiene contenido propio por cuenta. book_progress/ guarda
+// solo el progreso de lectura por usuario, separado del contenido por el
+// mismo motivo que mangas/ está separado de users/.
+const BOOKS_DIR = process.env.BOOKS_DIR || path.join(__dirname, "..", "books");
+const BOOK_PROGRESS_DIR = process.env.BOOK_PROGRESS_DIR || path.join(__dirname, "..", "book_progress");
+// Portada elegida por un admin para cada libro (ver sección "Libros
+// electrónicos" más abajo) — es un solo fichero compartido, no por usuario
+// como book_progress/: todo el mundo ve la misma portada que el admin eligió.
+const BOOK_COVERS_DIR = process.env.BOOK_COVERS_DIR || path.join(__dirname, "..", "book_covers");
+const BOOK_COVERS_FILE = path.join(BOOK_COVERS_DIR, "covers.json");
+const DEFAULT_PREFERENCES = { theme: "light", readingMode: "scroll", pageTurnMode: "swipe" };
 
 // username termina siendo parte de un nombre de fichero (ver /register y
 // readUserData/writeUserData) — solo caracteres seguros para una ruta.
@@ -105,6 +117,13 @@ const MAX_MANGA_NAME_LENGTH = 200;
 const MAX_FAVORITES = 500;
 const MAX_FINISHED_MANGAS = 500;
 const MAX_CHAPTERS_PER_MANGA = 5000;
+const MAX_LOCATOR_LENGTH = 500;
+
+// Formatos de libro soportados y su Content-Type al servir el fichero.
+const BOOK_FORMATS = {
+  ".epub": "application/epub+zip",
+  ".pdf": "application/pdf"
+};
 
 // Administradores fijos por ahora (no hay gestión de roles todavía).
 const ADMIN_USERNAMES = new Set(["Joao"]);
@@ -126,6 +145,9 @@ webPush.setVapidDetails(
 fs.ensureDirSync(STORAGE_DIR);
 fs.ensureDirSync(NOTIFICATIONS_DIR);
 fs.ensureDirSync(USERS_DIR);
+fs.ensureDirSync(BOOKS_DIR);
+fs.ensureDirSync(BOOK_PROGRESS_DIR);
+fs.ensureDirSync(BOOK_COVERS_DIR);
 
 // Middleware para validar el token
 function authenticateToken(req, res, next) {
@@ -247,6 +269,57 @@ async function readUserData(username) {
 async function writeUserData(username, data) {
   const file = path.join(STORAGE_DIR, `${username}.json`);
   await fs.writeFile(file, JSON.stringify(data, null, 2));
+}
+
+// Helpers para book_progress/{username}.json — { [bookId]: { locator, updatedAt } }
+async function readBookProgress(username) {
+  const file = path.join(BOOK_PROGRESS_DIR, `${username}.json`);
+  try {
+    const content = await fs.readFile(file, "utf8");
+    return JSON.parse(content);
+  } catch {
+    return {};
+  }
+}
+
+async function writeBookProgress(username, data) {
+  const file = path.join(BOOK_PROGRESS_DIR, `${username}.json`);
+  await fs.writeFile(file, JSON.stringify(data, null, 2));
+}
+
+// Helpers para book_covers/covers.json — { [bookId]: { url, updatedAt, updatedBy } }
+async function readBookCovers() {
+  try {
+    const content = await fs.readFile(BOOK_COVERS_FILE, "utf8");
+    return JSON.parse(content);
+  } catch {
+    return {};
+  }
+}
+
+async function writeBookCovers(covers) {
+  await fs.writeFile(BOOK_COVERS_FILE, JSON.stringify(covers, null, 2));
+}
+
+// id de libro = nombre de fichero dentro de BOOKS_DIR. Igual que con
+// username (ver USERNAME_RE más arriba, y el incidente documentado en
+// CLAUDE.md), un id como "../users/users.json" no puede resolver fuera de
+// BOOKS_DIR — se comprueba la ruta resuelta, no solo el string de entrada.
+function resolveBookPath(id) {
+  if (!id || typeof id !== "string") return null;
+  const resolved = path.resolve(BOOKS_DIR, id);
+  const base = path.resolve(BOOKS_DIR) + path.sep;
+  if (!resolved.startsWith(base)) return null;
+  const ext = path.extname(resolved).toLowerCase();
+  if (!BOOK_FORMATS[ext]) return null;
+  return resolved;
+}
+
+function titleFromFilename(filename) {
+  return path.basename(filename, path.extname(filename))
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 // Carga suscripciones existentes o crea un array vacío
@@ -591,6 +664,165 @@ app.get("/proxy", authenticateToken, async (req, res) => {
     console.error(err);
     res.status(500).json({ error: "No se pudo obtener la imagen" });
   }
+});
+
+// --- Libros electrónicos (EPUB/PDF) ---
+// Los archivos viven en BOOKS_DIR, copiados a mano por el owner (nunca
+// subidos desde la web). Se sirven directamente desde el backend, no a
+// través de /proxy: son same-origin y propios, así que no hace falta la
+// indirección de CORS/SSRF que sí necesitan las imágenes de InManga.
+
+app.get("/books", authenticateToken, async (req, res) => {
+  let files;
+  try {
+    files = await fs.readdir(BOOKS_DIR);
+  } catch {
+    return res.json({ success: true, books: [] });
+  }
+
+  const covers = await readBookCovers();
+
+  const books = [];
+  for (const file of files) {
+    const ext = path.extname(file).toLowerCase();
+    if (!BOOK_FORMATS[ext]) continue;
+    const fullPath = path.join(BOOKS_DIR, file);
+    try {
+      const stat = await fs.stat(fullPath);
+      if (!stat.isFile()) continue;
+      books.push({
+        id: file,
+        title: titleFromFilename(file),
+        format: ext.slice(1),
+        sizeBytes: stat.size,
+        coverUrl: covers[file]?.url || null
+      });
+    } catch {
+      // fichero desapareció entre el readdir y el stat: se omite sin más
+    }
+  }
+
+  res.json({ success: true, books });
+});
+
+app.get("/books/:id/file", authenticateToken, async (req, res) => {
+  const fullPath = resolveBookPath(req.params.id);
+  if (!fullPath || !(await fs.pathExists(fullPath))) {
+    return res.status(404).json({ error: "Libro no encontrado" });
+  }
+  const ext = path.extname(fullPath).toLowerCase();
+  res.set("Content-Type", BOOK_FORMATS[ext]);
+  const stream = fs.createReadStream(fullPath);
+  stream.on("error", err => {
+    console.error("Error leyendo el libro:", err);
+    res.end();
+  });
+  stream.pipe(res);
+});
+
+app.get("/books/progress", authenticateToken, async (req, res) => {
+  const progress = await readBookProgress(req.user.username);
+  res.json({ success: true, progress });
+});
+
+app.post("/books/:id/progress", authenticateToken, async (req, res) => {
+  const fullPath = resolveBookPath(req.params.id);
+  if (!fullPath) return res.status(400).json({ error: "id de libro no válido" });
+
+  const { locator, percent } = req.body;
+  if (typeof locator !== "string" || !locator || locator.length > MAX_LOCATOR_LENGTH) {
+    return res.status(400).json({ error: "locator no válido" });
+  }
+  // percent es opcional (clientes antiguos, o formatos donde no se pueda
+  // calcular) — cuando viene, tiene que ser un número real 0-100. Se usa en
+  // la biblioteca para clasificar cada libro entre "en progreso"/"terminado"
+  // sin tener que abrir el libro para saberlo.
+  let normalizedPercent = null;
+  if (percent !== undefined && percent !== null) {
+    if (typeof percent !== "number" || !Number.isFinite(percent) || percent < 0 || percent > 100) {
+      return res.status(400).json({ error: "percent no válido" });
+    }
+    normalizedPercent = Math.round(percent);
+  }
+
+  const username = req.user.username;
+  const progress = await readBookProgress(username);
+  // Si esta actualización no trae un percent (cliente antiguo, o un
+  // reenvío del locator local sin recalcularlo — ver resolveStartingLocator/
+  // syncPendingOfflineProgress en el frontend), no se debe pisar un percent
+  // numérico ya conocido con null: eso borraría de golpe la clasificación
+  // "en progreso"/"terminado" de un libro que ya se sabía en qué punto iba.
+  const existing = progress[req.params.id];
+  const finalPercent = normalizedPercent !== null
+    ? normalizedPercent
+    : (typeof existing?.percent === "number" ? existing.percent : null);
+  progress[req.params.id] = { locator, percent: finalPercent, updatedAt: new Date().toISOString() };
+  await writeBookProgress(username, progress);
+  res.json({ success: true, progress: progress[req.params.id] });
+});
+
+// Portadas de libros elegidas a mano por un admin (no hay metadata real de
+// EPUB/PDF que la app extraiga) — se buscan candidatas en Open Library (su
+// API de búsqueda y su servicio de portadas son públicos, sin API key; a
+// diferencia de la API de Google Books, que sin clave devuelve 429 "quota
+// exceeded" — comprobado en vivo, no es una opción viable sin pedirle al
+// owner que gestione una clave). El admin elige una entre los resultados —
+// no todas tienen portada real, Open Library sirve un placeholder gris
+// diminuto cuando no la tiene, así que se ve a simple vista en la rejilla
+// de resultados cuál conviene elegir — y queda guardada para que la vean
+// todos los usuarios por igual (ver GET /books).
+const MAX_COVER_QUERY_LENGTH = 200;
+
+app.post("/admin/books/:id/cover_search", authenticateToken, requireAdmin, async (req, res) => {
+  if (!resolveBookPath(req.params.id)) {
+    return res.status(400).json({ error: "id de libro no válido" });
+  }
+
+  const query = (typeof req.body.query === "string" && req.body.query.trim())
+    ? req.body.query.trim().slice(0, MAX_COVER_QUERY_LENGTH)
+    : titleFromFilename(req.params.id);
+
+  try {
+    const response = await axios.get("https://openlibrary.org/search.json", {
+      params: { title: query, limit: 20 },
+      timeout: 10000
+    });
+    const results = (response.data.docs || [])
+      .filter(doc => doc.cover_i)
+      .slice(0, 16)
+      .map(doc => ({
+        title: doc.title || null,
+        authors: doc.author_name || [],
+        thumbnail: `https://covers.openlibrary.org/b/id/${doc.cover_i}-M.jpg`,
+        fullImage: `https://covers.openlibrary.org/b/id/${doc.cover_i}-L.jpg`
+      }));
+    res.json({ success: true, results });
+  } catch (err) {
+    console.error("Error buscando portadas:", err);
+    res.status(500).json({ error: "No se pudo buscar portadas" });
+  }
+});
+
+app.post("/admin/books/:id/cover", authenticateToken, requireAdmin, async (req, res) => {
+  if (!resolveBookPath(req.params.id)) {
+    return res.status(400).json({ error: "id de libro no válido" });
+  }
+
+  const { coverUrl } = req.body;
+  // coverUrl: null quita la portada elegida (vuelve a la generada en el
+  // cliente). Si no, tiene que ser una URL https:// real.
+  if (coverUrl !== null && (typeof coverUrl !== "string" || !/^https:\/\//.test(coverUrl))) {
+    return res.status(400).json({ error: "coverUrl no válida" });
+  }
+
+  const covers = await readBookCovers();
+  if (coverUrl === null) {
+    delete covers[req.params.id];
+  } else {
+    covers[req.params.id] = { url: coverUrl, updatedAt: new Date().toISOString(), updatedBy: req.user.username };
+  }
+  await writeBookCovers(covers);
+  res.json({ success: true, coverUrl: coverUrl });
 });
 
 app.get('/vapidPublicKey', (req, res) => {
